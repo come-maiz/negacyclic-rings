@@ -418,9 +418,9 @@ pub(in crate::poly) mod avx2 {
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn sub_mod_v(a: __m256i, b: __m256i, q_v: __m256i) -> __m256i {
-        let d = _mm256_sub_epi32(a, b);
-        let neg = _mm256_cmpgt_epi32(_mm256_setzero_si256(), d);
-        _mm256_add_epi32(d, _mm256_and_si256(neg, q_v))
+        let difference = _mm256_sub_epi32(a, b);
+        let negative = _mm256_cmpgt_epi32(_mm256_setzero_si256(), difference);
+        _mm256_add_epi32(difference, _mm256_and_si256(negative, q_v))
     }
 
     /// Forward stages with `ht = 4, 2, 1`. All three pair elements inside one
