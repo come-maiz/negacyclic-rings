@@ -595,12 +595,12 @@ pub(in crate::poly) mod avx2 {
         let qinv_v = _mm256_set1_epi64x(ring.q_inv_neg as i64);
         let r2_v = _mm256_set1_epi32(ring.r2 as i32);
         for chunk in 0..(N / LANES) {
-            let off = chunk * LANES;
-            let a = _mm256_loadu_si256(lhs.as_ptr().add(off) as *const __m256i);
-            let b = _mm256_loadu_si256(rhs.as_ptr().add(off) as *const __m256i);
+            let offset = chunk * LANES;
+            let a = _mm256_loadu_si256(lhs.as_ptr().add(offset) as *const __m256i);
+            let b = _mm256_loadu_si256(rhs.as_ptr().add(offset) as *const __m256i);
             let t = mont_mul_v(a, b, q64_v, qinv_v);
             let c = mont_mul_v(t, r2_v, q64_v, qinv_v);
-            _mm256_storeu_si256(out.as_mut_ptr().add(off) as *mut __m256i, c);
+            _mm256_storeu_si256(out.as_mut_ptr().add(offset) as *mut __m256i, c);
         }
     }
 
@@ -662,16 +662,16 @@ pub(in crate::poly) mod avx2 {
         let qinv_v = _mm256_set1_epi64x(ring.q_inv_neg as i64);
         let r2_v = _mm256_set1_epi32(ring.r2 as i32);
         for chunk in 0..(N / LANES) {
-            let off = chunk * LANES;
+            let offset = chunk * LANES;
             let mut mont_acc = _mm256_setzero_si256();
             for k in 0..a.len() {
-                let av = _mm256_loadu_si256(a[k].as_ptr().add(off) as *const __m256i);
-                let bv = _mm256_loadu_si256(b[k].as_ptr().add(off) as *const __m256i);
+                let av = _mm256_loadu_si256(a[k].as_ptr().add(offset) as *const __m256i);
+                let bv = _mm256_loadu_si256(b[k].as_ptr().add(offset) as *const __m256i);
                 let prod = mont_mul_v(av, bv, q64_v, qinv_v);
                 mont_acc = add_mod_v(mont_acc, prod, q_v);
             }
             let canon = mont_mul_v(mont_acc, r2_v, q64_v, qinv_v);
-            _mm256_storeu_si256(out.as_mut_ptr().add(off) as *mut __m256i, canon);
+            _mm256_storeu_si256(out.as_mut_ptr().add(offset) as *mut __m256i, canon);
         }
     }
 
@@ -688,12 +688,12 @@ pub(in crate::poly) mod avx2 {
         let qinv_v = _mm256_set1_epi64x(ring.q_inv_neg as i64);
         let r2_v = _mm256_set1_epi32(ring.r2 as i32);
         for chunk in 0..(N / LANES) {
-            let off = chunk * LANES;
-            let acc_ptr = acc.as_mut_ptr().add(off) as *mut __m256i;
+            let offset = chunk * LANES;
+            let acc_ptr = acc.as_mut_ptr().add(offset) as *mut __m256i;
             let mut mont_acc = _mm256_setzero_si256();
             for k in 0..a.len() {
-                let av = _mm256_loadu_si256(a[k][channel].as_ptr().add(off) as *const __m256i);
-                let bv = _mm256_loadu_si256(b[k][channel].as_ptr().add(off) as *const __m256i);
+                let av = _mm256_loadu_si256(a[k][channel].as_ptr().add(offset) as *const __m256i);
+                let bv = _mm256_loadu_si256(b[k][channel].as_ptr().add(offset) as *const __m256i);
                 let prod = mont_mul_v(av, bv, q64_v, qinv_v);
                 mont_acc = add_mod_v(mont_acc, prod, q_v);
             }
@@ -885,8 +885,8 @@ pub(in crate::poly) mod neon {
         }
         debug_assert_eq!(t, LANES);
         if LAZY {
-            for off in (0..N).step_by(LANES) {
-                let ptr = coefficients.as_mut_ptr().add(off);
+            for offset in (0..N).step_by(LANES) {
+                let ptr = coefficients.as_mut_ptr().add(offset);
                 let v = vreinterpretq_s32_u32(vld1q_u32(ptr));
                 vst1q_u32(ptr, vreinterpretq_u32_s32(sub_if_ge(v, q_v)));
             }
@@ -1072,8 +1072,8 @@ pub(in crate::poly) mod neon {
             m = hm;
         }
         let (n_inv, scaled) = twiddle_v(ring.n_inv, ring.n_inv_shoup, ring.q);
-        for off in (0..N).step_by(LANES) {
-            let ptr = coefficients.as_mut_ptr().add(off);
+        for offset in (0..N).step_by(LANES) {
+            let ptr = coefficients.as_mut_ptr().add(offset);
             let v = vreinterpretq_s32_u32(vld1q_u32(ptr));
             vst1q_u32(
                 ptr,
@@ -1131,12 +1131,12 @@ pub(in crate::poly) mod neon {
     ) {
         let r2 = vdupq_n_u32(ring.r2);
         let vector_end = N / LANES * LANES;
-        for off in (0..vector_end).step_by(LANES) {
-            let a = vld1q_u32(lhs.as_ptr().add(off));
-            let b = vld1q_u32(rhs.as_ptr().add(off));
+        for offset in (0..vector_end).step_by(LANES) {
+            let a = vld1q_u32(lhs.as_ptr().add(offset));
+            let b = vld1q_u32(rhs.as_ptr().add(offset));
             let t = mont_mul_v(a, b, ring.q, ring.q_inv_neg);
             vst1q_u32(
-                out.as_mut_ptr().add(off),
+                out.as_mut_ptr().add(offset),
                 mont_mul_v(t, r2, ring.q, ring.q_inv_neg),
             );
         }
@@ -1185,16 +1185,16 @@ pub(in crate::poly) mod neon {
         let q_v = vdupq_n_s32(ring.q as i32);
         let r2 = vdupq_n_u32(ring.r2);
         let vector_end = N / LANES * LANES;
-        for off in (0..vector_end).step_by(LANES) {
+        for offset in (0..vector_end).step_by(LANES) {
             let mut mont_acc = vdupq_n_s32(0);
             for k in 0..a.len() {
-                let av = vld1q_u32(a[k].as_ptr().add(off));
-                let bv = vld1q_u32(b[k].as_ptr().add(off));
+                let av = vld1q_u32(a[k].as_ptr().add(offset));
+                let bv = vld1q_u32(b[k].as_ptr().add(offset));
                 let prod = mont_mul_v(av, bv, ring.q, ring.q_inv_neg);
                 mont_acc = add_mod_v(mont_acc, vreinterpretq_s32_u32(prod), q_v);
             }
             vst1q_u32(
-                out.as_mut_ptr().add(off),
+                out.as_mut_ptr().add(offset),
                 mont_mul_v(vreinterpretq_u32_s32(mont_acc), r2, ring.q, ring.q_inv_neg),
             );
         }
@@ -1217,18 +1217,18 @@ pub(in crate::poly) mod neon {
         let q_v = vdupq_n_s32(ring.q as i32);
         let r2 = vdupq_n_u32(ring.r2);
         let vector_end = N / LANES * LANES;
-        for off in (0..vector_end).step_by(LANES) {
+        for offset in (0..vector_end).step_by(LANES) {
             let mut mont_acc = vdupq_n_s32(0);
             for k in 0..a.len() {
-                let av = vld1q_u32(a[k][channel].as_ptr().add(off));
-                let bv = vld1q_u32(b[k][channel].as_ptr().add(off));
+                let av = vld1q_u32(a[k][channel].as_ptr().add(offset));
+                let bv = vld1q_u32(b[k][channel].as_ptr().add(offset));
                 let prod = mont_mul_v(av, bv, ring.q, ring.q_inv_neg);
                 mont_acc = add_mod_v(mont_acc, vreinterpretq_s32_u32(prod), q_v);
             }
             let canon = mont_mul_v(vreinterpretq_u32_s32(mont_acc), r2, ring.q, ring.q_inv_neg);
-            let acc_v = vreinterpretq_s32_u32(vld1q_u32(acc.as_ptr().add(off)));
+            let acc_v = vreinterpretq_s32_u32(vld1q_u32(acc.as_ptr().add(offset)));
             vst1q_u32(
-                acc.as_mut_ptr().add(off),
+                acc.as_mut_ptr().add(offset),
                 vreinterpretq_u32_s32(add_mod_v(acc_v, vreinterpretq_s32_u32(canon), q_v)),
             );
         }
