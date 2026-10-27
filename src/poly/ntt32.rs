@@ -181,8 +181,8 @@ fn inv_ntt_stages_scalar<const N: usize>(
 }
 
 fn inv_ntt_final_scale_scalar<const N: usize>(ring: &Ring32<N>, coefficients: &mut [u32; N]) {
-    for e in coefficients.iter_mut() {
-        *e = shoup_mul(*e, ring.n_inv, ring.n_inv_shoup, ring.q);
+    for coefficient in coefficients.iter_mut() {
+        *coefficient = shoup_mul(*coefficient, ring.n_inv, ring.n_inv_shoup, ring.q);
     }
 }
 
