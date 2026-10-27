@@ -555,9 +555,9 @@ pub(in crate::poly) mod avx2 {
             let ws = twiddle_quads(&ring.inv_ntt_table_shoup[j..j + 4]);
             let u = _mm256_shuffle_epi32::<0xA0>(x);
             let v = _mm256_shuffle_epi32::<0xF5>(x);
-            let s = add_mod_v(u, v, q_v);
-            let d = shoup_mul_v(sub_mod_v(u, v, q_v), w, ws, q_v);
-            x = _mm256_blend_epi32::<0x55>(_mm256_slli_epi64::<32>(d), s);
+            let new_u = add_mod_v(u, v, q_v);
+            let new_v = shoup_mul_v(sub_mod_v(u, v, q_v), w, ws, q_v);
+            x = _mm256_blend_epi32::<0x55>(_mm256_slli_epi64::<32>(new_v), new_u);
 
             // t = 2
             let (i0, i1) = (mb + 2 * g, mb + 2 * g + 1);
@@ -565,18 +565,18 @@ pub(in crate::poly) mod avx2 {
             let ws = twiddle_pairs(ring.inv_ntt_table_shoup[i0], ring.inv_ntt_table_shoup[i1]);
             let u = _mm256_unpacklo_epi64(x, x);
             let v = _mm256_unpackhi_epi64(x, x);
-            let s = add_mod_v(u, v, q_v);
-            let d = shoup_mul_v(sub_mod_v(u, v, q_v), w, ws, q_v);
-            x = _mm256_unpacklo_epi64(s, d);
+            let new_u = add_mod_v(u, v, q_v);
+            let new_v = shoup_mul_v(sub_mod_v(u, v, q_v), w, ws, q_v);
+            x = _mm256_unpacklo_epi64(new_u, new_v);
 
             // t = 4
             let w = _mm256_set1_epi32(ring.inv_ntt_table[mc + g] as i32);
             let ws = _mm256_set1_epi32(ring.inv_ntt_table_shoup[mc + g] as i32);
             let u = _mm256_permute2x128_si256::<0x00>(x, x);
             let v = _mm256_permute2x128_si256::<0x11>(x, x);
-            let s = add_mod_v(u, v, q_v);
-            let d = shoup_mul_v(sub_mod_v(u, v, q_v), w, ws, q_v);
-            x = _mm256_permute2x128_si256::<0x20>(s, d);
+            let new_u = add_mod_v(u, v, q_v);
+            let new_v = shoup_mul_v(sub_mod_v(u, v, q_v), w, ws, q_v);
+            x = _mm256_permute2x128_si256::<0x20>(new_u, new_v);
 
             _mm256_storeu_si256(ptr, x);
         }
