@@ -371,8 +371,11 @@ pub(in crate::poly) mod avx2 {
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn shoup_mul_v(a: __m256i, w_v: __m256i, ws_v: __m256i, q_v: __m256i) -> __m256i {
-        let qq = mulhi32(a, ws_v);
-        let r = _mm256_sub_epi32(_mm256_mullo_epi32(a, w_v), _mm256_mullo_epi32(qq, q_v));
+        let quotient = mulhi32(a, ws_v);
+        let r = _mm256_sub_epi32(
+            _mm256_mullo_epi32(a, w_v),
+            _mm256_mullo_epi32(quotient, q_v),
+        );
         csub32(r, q_v)
     }
 
