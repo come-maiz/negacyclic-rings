@@ -31,96 +31,37 @@ pub struct Ring32<const N: usize> {
     pub n_inv_shoup: u32,
 }
 
-/// Maps `x` in `[0, 2q)` to `[0, q)`: `x - q` if that is non-negative, else
-/// `x`. Branchless: `2q < 2^31` means the difference's sign bit is a valid
-/// predicate, so this is a shift and a mask rather than an unpredictable
-/// conditional jump.
-#[inline(always)]
-fn csub(x: u32, q: u32) -> u32 {
-    let d = x.wrapping_sub(q);
-    d.wrapping_add(q & (((d as i32) >> 31) as u32))
-}
-
-#[inline(always)]
-pub fn add_mod(a: u32, b: u32, q: u32) -> u32 {
-    csub(a + b, q)
-}
-
-#[inline(always)]
-pub fn sub_mod(a: u32, b: u32, q: u32) -> u32 {
-    let d = a.wrapping_sub(b);
-    d.wrapping_add(q & (((d as i32) >> 31) as u32))
-}
-
-#[inline(always)]
-fn shoup_mul(a: u32, w: u32, w_shoup: u32, q: u32) -> u32 {
-    let qq = ((a as u64 * w_shoup as u64) >> 32) as u32;
-    csub(a.wrapping_mul(w).wrapping_sub(qq.wrapping_mul(q)), q)
-}
-
-/// Montgomery reduction: `x < q·2^32` → `x·2^-32 mod q`, canonical.
-#[inline(always)]
-pub fn mont_reduce<const N: usize>(x: u64, ring: &Ring32<N>) -> u32 {
-    let m = (x as u32).wrapping_mul(ring.q_inv_neg);
-    let t = ((x + m as u64 * ring.q as u64) >> 32) as u32;
-    csub(t, ring.q)
-}
-
-/// `a·b·2^-32 mod q` (Montgomery-domain product).
-#[inline(always)]
-pub fn mont_mul<const N: usize>(a: u32, b: u32, ring: &Ring32<N>) -> u32 {
-    mont_reduce(a as u64 * b as u64, ring)
-}
-
-/// Modular product `a·b mod q`, not in Montgomery form, for canonical inputs.
-#[inline(always)]
-pub fn mul_mod<const N: usize>(a: u32, b: u32, ring: &Ring32<N>) -> u32 {
-    mont_mul(mont_mul(a, b, ring), ring.r2, ring)
-}
-
-#[inline]
-pub fn add_assign<const N: usize>(ring: &Ring32<N>, lhs: &mut [u32; N], rhs: &[u32; N]) {
-    for (x, &y) in lhs.iter_mut().zip(rhs) {
-        *x = add_mod(*x, y, ring.q);
-    }
-}
-
-#[inline]
-pub fn sub_assign<const N: usize>(ring: &Ring32<N>, lhs: &mut [u32; N], rhs: &[u32; N]) {
-    for (x, &y) in lhs.iter_mut().zip(rhs) {
-        *x = sub_mod(*x, y, ring.q);
-    }
-}
-
-#[inline]
-pub fn pointwise_mul<const N: usize>(ring: &Ring32<N>, lhs: &[u32; N], rhs: &[u32; N]) -> [u32; N] {
-    #[cfg(target_arch = "x86_64")]
-    if N >= 8 && avx2_available() {
-        let mut out = [0u32; N];
-        unsafe { avx2::pointwise_mul_avx2(ring, &mut out, lhs, rhs) };
-        return out;
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let mut out = [0u32; N];
-        unsafe { neon::pointwise_mul_neon(ring, &mut out, lhs, rhs) };
-        return out;
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        core::array::from_fn(|i| mul_mod(lhs[i], rhs[i], ring))
-    }
-}
-
 // `Residues`/`Rns` live in `super::rns`; pulled in here (and, transitively,
 // into the `avx2`/`neon` submodules below via `super::`) because
 // `pointwise_mac` and the RNS-specific SIMD kernels are channel-indexed over
 // them.
 use super::rns::{Residues, Rns};
 
-// ---------------------------------------------------------------
-// Scalar NTT.
-// ---------------------------------------------------------------
+/// Forward NTT over canonical `[0, q)` values, in place.
+pub fn ntt<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
+    assert!(N.is_power_of_two(), "NTT degree must be a power of two");
+    #[cfg(target_arch = "x86_64")]
+    if N >= 8 && avx2_available() {
+        unsafe { avx2::ntt_avx2(ring, p) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if N >= 4 {
+        unsafe { neon::ntt_neon(ring, p) };
+        return;
+    }
+    ntt_scalar(ring, p);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(in crate::poly) fn avx2_available() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+
+fn ntt_scalar<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
+    ntt_stages_scalar(ring, p, 0, N);
+}
 
 fn ntt_stages_scalar<const N: usize>(
     ring: &Ring32<N>,
@@ -151,6 +92,55 @@ fn ntt_stages_scalar<const N: usize>(
         }
         t = ht;
     }
+}
+
+#[inline(always)]
+fn shoup_mul(a: u32, w: u32, w_shoup: u32, q: u32) -> u32 {
+    let qq = ((a as u64 * w_shoup as u64) >> 32) as u32;
+    csub(a.wrapping_mul(w).wrapping_sub(qq.wrapping_mul(q)), q)
+}
+
+/// Maps `x` in `[0, 2q)` to `[0, q)`: `x - q` if that is non-negative, else
+/// `x`. Branchless: `2q < 2^31` means the difference's sign bit is a valid
+/// predicate, so this is a shift and a mask rather than an unpredictable
+/// conditional jump.
+#[inline(always)]
+fn csub(x: u32, q: u32) -> u32 {
+    let d = x.wrapping_sub(q);
+    d.wrapping_add(q & (((d as i32) >> 31) as u32))
+}
+
+#[inline(always)]
+pub fn add_mod(a: u32, b: u32, q: u32) -> u32 {
+    csub(a + b, q)
+}
+
+#[inline(always)]
+pub fn sub_mod(a: u32, b: u32, q: u32) -> u32 {
+    let d = a.wrapping_sub(b);
+    d.wrapping_add(q & (((d as i32) >> 31) as u32))
+}
+
+/// Inverse NTT over canonical `[0, q)` values, in place (includes the final
+/// `N^-1` scaling).
+pub fn inv_ntt<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
+    assert!(N.is_power_of_two(), "NTT degree must be a power of two");
+    #[cfg(target_arch = "x86_64")]
+    if N >= 8 && avx2_available() {
+        unsafe { avx2::inv_ntt_avx2(ring, p) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if N >= 4 {
+        unsafe { neon::inv_ntt_neon(ring, p) };
+        return;
+    }
+    inv_ntt_scalar(ring, p);
+}
+
+fn inv_ntt_scalar<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
+    inv_ntt_stages_scalar(ring, p, N.trailing_zeros() as usize, 1, N);
+    inv_ntt_final_scale_scalar(ring, p);
 }
 
 fn inv_ntt_stages_scalar<const N: usize>(
@@ -196,72 +186,44 @@ fn inv_ntt_final_scale_scalar<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]
     }
 }
 
-fn ntt_scalar<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
-    ntt_stages_scalar(ring, p, 0, N);
-}
-
-fn inv_ntt_scalar<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
-    inv_ntt_stages_scalar(ring, p, N.trailing_zeros() as usize, 1, N);
-    inv_ntt_final_scale_scalar(ring, p);
-}
-
-// ---------------------------------------------------------------
-// Public entry points with architecture-specific SIMD dispatch.
-// ---------------------------------------------------------------
-
-#[cfg(target_arch = "x86_64")]
 #[inline]
-pub(in crate::poly) fn avx2_available() -> bool {
-    std::is_x86_feature_detected!("avx2")
-}
-
-/// Forward NTT over canonical `[0, q)` values, in place.
-pub fn ntt<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
-    assert!(N.is_power_of_two(), "NTT degree must be a power of two");
+pub fn pointwise_mul<const N: usize>(ring: &Ring32<N>, lhs: &[u32; N], rhs: &[u32; N]) -> [u32; N] {
     #[cfg(target_arch = "x86_64")]
     if N >= 8 && avx2_available() {
-        unsafe { avx2::ntt_avx2(ring, p) };
-        return;
+        let mut out = [0u32; N];
+        unsafe { avx2::pointwise_mul_avx2(ring, &mut out, lhs, rhs) };
+        return out;
     }
     #[cfg(target_arch = "aarch64")]
-    if N >= 4 {
-        unsafe { neon::ntt_neon(ring, p) };
-        return;
+    {
+        let mut out = [0u32; N];
+        unsafe { neon::pointwise_mul_neon(ring, &mut out, lhs, rhs) };
+        return out;
     }
-    ntt_scalar(ring, p);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        core::array::from_fn(|i| mul_mod(lhs[i], rhs[i], ring))
+    }
 }
 
-/// Inverse NTT over canonical `[0, q)` values, in place (includes the final
-/// `N^-1` scaling).
-pub fn inv_ntt<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
-    assert!(N.is_power_of_two(), "NTT degree must be a power of two");
-    #[cfg(target_arch = "x86_64")]
-    if N >= 8 && avx2_available() {
-        unsafe { avx2::inv_ntt_avx2(ring, p) };
-        return;
-    }
-    #[cfg(target_arch = "aarch64")]
-    if N >= 4 {
-        unsafe { neon::inv_ntt_neon(ring, p) };
-        return;
-    }
-    inv_ntt_scalar(ring, p);
+/// Modular product `a·b mod q`, not in Montgomery form, for canonical inputs.
+#[inline(always)]
+pub fn mul_mod<const N: usize>(a: u32, b: u32, ring: &Ring32<N>) -> u32 {
+    mont_mul(mont_mul(a, b, ring), ring.r2, ring)
 }
 
-fn pointwise_dot_scalar<const N: usize>(
-    ring: &Ring32<N>,
-    a: &[[u32; N]],
-    b: &[[u32; N]],
-) -> [u32; N] {
-    let mut out = [0u32; N];
-    for i in 0..N {
-        let mut mont_acc = 0;
-        for (av, bv) in a.iter().zip(b) {
-            mont_acc = add_mod(mont_acc, mont_mul(av[i], bv[i], ring), ring.q);
-        }
-        out[i] = mont_mul(mont_acc, ring.r2, ring);
-    }
-    out
+/// `a·b·2^-32 mod q` (Montgomery-domain product).
+#[inline(always)]
+pub fn mont_mul<const N: usize>(a: u32, b: u32, ring: &Ring32<N>) -> u32 {
+    mont_reduce(a as u64 * b as u64, ring)
+}
+
+/// Montgomery reduction: `x < q·2^32` → `x·2^-32 mod q`, canonical.
+#[inline(always)]
+pub fn mont_reduce<const N: usize>(x: u64, ring: &Ring32<N>) -> u32 {
+    let m = (x as u32).wrapping_mul(ring.q_inv_neg);
+    let t = ((x + m as u64 * ring.q as u64) >> 32) as u32;
+    csub(t, ring.q)
 }
 
 /// `out[i] = Σ_k a[k][i]·b[k][i] (mod q)` for canonical inputs.
@@ -283,27 +245,20 @@ pub fn pointwise_dot<const N: usize>(ring: &Ring32<N>, a: &[[u32; N]], b: &[[u32
     pointwise_dot_scalar(ring, a, b)
 }
 
-fn pointwise_mac_scalar<const N: usize, const CHANNEL_COUNT: usize>(
+fn pointwise_dot_scalar<const N: usize>(
     ring: &Ring32<N>,
-    acc: &mut [u32; N],
-    a: &[&Residues<N, CHANNEL_COUNT>],
-    b: &[&Residues<N, CHANNEL_COUNT>],
-    channel: usize,
-) {
-    let q = ring.q;
-    let mut mont_acc = [0u32; N];
-    for (av, bv) in a.iter().zip(b.iter()) {
-        for i in 0..N {
-            mont_acc[i] = add_mod(
-                mont_acc[i],
-                mont_mul(av[channel][i], bv[channel][i], ring),
-                q,
-            );
-        }
-    }
+    a: &[[u32; N]],
+    b: &[[u32; N]],
+) -> [u32; N] {
+    let mut out = [0u32; N];
     for i in 0..N {
-        acc[i] = add_mod(acc[i], mont_mul(mont_acc[i], ring.r2, ring), q);
+        let mut mont_acc = 0;
+        for (av, bv) in a.iter().zip(b) {
+            mont_acc = add_mod(mont_acc, mont_mul(av[i], bv[i], ring), ring.q);
+        }
+        out[i] = mont_mul(mont_acc, ring.r2, ring);
     }
+    out
 }
 
 /// `acc[i] += Σ_k a[k][channel][i]·b[k][channel][i] (mod q)` for canonical inputs. Takes
@@ -331,12 +286,46 @@ pub fn pointwise_mac<const N: usize, const CHANNEL_COUNT: usize>(
     pointwise_mac_scalar(ring, acc, a, b, channel);
 }
 
-// ---------------------------------------------------------------
+fn pointwise_mac_scalar<const N: usize, const CHANNEL_COUNT: usize>(
+    ring: &Ring32<N>,
+    acc: &mut [u32; N],
+    a: &[&Residues<N, CHANNEL_COUNT>],
+    b: &[&Residues<N, CHANNEL_COUNT>],
+    channel: usize,
+) {
+    let q = ring.q;
+    let mut mont_acc = [0u32; N];
+    for (av, bv) in a.iter().zip(b.iter()) {
+        for i in 0..N {
+            mont_acc[i] = add_mod(
+                mont_acc[i],
+                mont_mul(av[channel][i], bv[channel][i], ring),
+                q,
+            );
+        }
+    }
+    for i in 0..N {
+        acc[i] = add_mod(acc[i], mont_mul(mont_acc[i], ring.r2, ring), q);
+    }
+}
+
+#[inline]
+pub fn add_assign<const N: usize>(ring: &Ring32<N>, lhs: &mut [u32; N], rhs: &[u32; N]) {
+    for (x, &y) in lhs.iter_mut().zip(rhs) {
+        *x = add_mod(*x, y, ring.q);
+    }
+}
+
+#[inline]
+pub fn sub_assign<const N: usize>(ring: &Ring32<N>, lhs: &mut [u32; N], rhs: &[u32; N]) {
+    for (x, &y) in lhs.iter_mut().zip(rhs) {
+        *x = sub_mod(*x, y, ring.q);
+    }
+}
+
 // AVX2 kernels (8 × u32 lanes). Shoup butterflies use `_mm256_mullo_epi32`;
 // Montgomery products split the vector into even/odd u64 halves so
 // `_mm256_mul_epu32` supplies the 32x32->64 products.
-// ---------------------------------------------------------------
-
 #[cfg(target_arch = "x86_64")]
 pub(in crate::poly) mod avx2 {
     use super::{Residues, Ring32, Rns};
@@ -344,10 +333,44 @@ pub(in crate::poly) mod avx2 {
 
     const LANES: usize = 8;
 
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn ntt_avx2<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
+        let q_v = _mm256_set1_epi32(ring.q as i32);
+        let mut t = N;
+        for l in 0..(N.trailing_zeros() as usize - 3) {
+            let m = 1usize << l;
+            let ht = t >> 1;
+            let mut i = 0usize;
+            let mut j1 = 0usize;
+            while i < m {
+                let w_v = _mm256_set1_epi32(ring.ntt_table[m + i] as i32);
+                let ws_v = _mm256_set1_epi32(ring.ntt_table_shoup[m + i] as i32);
+                let mut j = j1;
+                while j < j1 + ht {
+                    let u = _mm256_loadu_si256(p.as_ptr().add(j) as *const __m256i);
+                    let v = _mm256_loadu_si256(p.as_ptr().add(j + ht) as *const __m256i);
+                    let v_red = shoup_mul_v(v, w_v, ws_v, q_v);
+                    let new_u = add_mod_v(u, v_red, q_v);
+                    let new_v = sub_mod_v(u, v_red, q_v);
+                    _mm256_storeu_si256(p.as_mut_ptr().add(j) as *mut __m256i, new_u);
+                    _mm256_storeu_si256(p.as_mut_ptr().add(j + ht) as *mut __m256i, new_v);
+                    j += LANES;
+                }
+                i += 1;
+                j1 += t;
+            }
+            t = ht;
+        }
+        debug_assert_eq!(t, 8);
+        ntt_tail(ring, p, q_v);
+    }
+
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn lo_mask() -> __m256i {
-        _mm256_set1_epi64x(0xFFFF_FFFF)
+    unsafe fn shoup_mul_v(a: __m256i, w_v: __m256i, ws_v: __m256i, q_v: __m256i) -> __m256i {
+        let qq = mulhi32(a, ws_v);
+        let r = _mm256_sub_epi32(_mm256_mullo_epi32(a, w_v), _mm256_mullo_epi32(qq, q_v));
+        csub32(r, q_v)
     }
 
     /// High 32 bits of each of the 8 lanewise u32 products.
@@ -365,6 +388,12 @@ pub(in crate::poly) mod avx2 {
         _mm256_or_si256(pe, _mm256_andnot_si256(mask, po))
     }
 
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn lo_mask() -> __m256i {
+        _mm256_set1_epi64x(0xFFFF_FFFF)
+    }
+
     /// `if v >= q { v - q } else { v }` for u32 lanes < 2^31.
     #[inline]
     #[target_feature(enable = "avx2")]
@@ -372,23 +401,6 @@ pub(in crate::poly) mod avx2 {
         let d = _mm256_sub_epi32(v, q_v);
         let lt = _mm256_cmpgt_epi32(_mm256_setzero_si256(), d);
         _mm256_blendv_epi8(d, v, lt)
-    }
-
-    /// Same, on 4 × u64 lanes holding values < 2^31.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn csub64(v: __m256i, q_v: __m256i) -> __m256i {
-        let d = _mm256_sub_epi64(v, q_v);
-        let lt = _mm256_cmpgt_epi64(_mm256_setzero_si256(), d);
-        _mm256_blendv_epi8(d, v, lt)
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn shoup_mul_v(a: __m256i, w_v: __m256i, ws_v: __m256i, q_v: __m256i) -> __m256i {
-        let qq = mulhi32(a, ws_v);
-        let r = _mm256_sub_epi32(_mm256_mullo_epi32(a, w_v), _mm256_mullo_epi32(qq, q_v));
-        csub32(r, q_v)
     }
 
     #[inline]
@@ -403,43 +415,6 @@ pub(in crate::poly) mod avx2 {
         let d = _mm256_sub_epi32(a, b);
         let neg = _mm256_cmpgt_epi32(_mm256_setzero_si256(), d);
         _mm256_add_epi32(d, _mm256_and_si256(neg, q_v))
-    }
-
-    /// Montgomery product on one u64 half: inputs are u32 values in the low
-    /// 32 bits of each u64 lane, output likewise, canonical in `[0, q)`.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn mont_mul_half(a: __m256i, b: __m256i, q64_v: __m256i, qinv_v: __m256i) -> __m256i {
-        let x = _mm256_mul_epu32(a, b);
-        mont_reduce_half(x, q64_v, qinv_v)
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn mont_reduce_half(x: __m256i, q64_v: __m256i, qinv_v: __m256i) -> __m256i {
-        let m = _mm256_and_si256(_mm256_mul_epu32(x, qinv_v), lo_mask());
-        let t = _mm256_srli_epi64(_mm256_add_epi64(x, _mm256_mul_epu32(m, q64_v)), 32);
-        csub64(t, q64_v)
-    }
-
-    /// Montgomery product `a·b·2^-32 mod q` across 8 u32 lanes.
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    unsafe fn mont_mul_v(a: __m256i, b: __m256i, q64_v: __m256i, qinv_v: __m256i) -> __m256i {
-        let mask = lo_mask();
-        let re = mont_mul_half(
-            _mm256_and_si256(a, mask),
-            _mm256_and_si256(b, mask),
-            q64_v,
-            qinv_v,
-        );
-        let ro = mont_mul_half(
-            _mm256_srli_epi64(a, 32),
-            _mm256_srli_epi64(b, 32),
-            q64_v,
-            qinv_v,
-        );
-        _mm256_or_si256(re, _mm256_slli_epi64(ro, 32))
     }
 
     /// Forward stages with `ht = 4, 2, 1`. All three pair elements inside one
@@ -506,6 +481,45 @@ pub(in crate::poly) mod avx2 {
         )
     }
 
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn inv_ntt_avx2<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
+        let q_v = _mm256_set1_epi32(ring.q as i32);
+        inv_ntt_tail(ring, p, q_v);
+        let (mut t, mut m) = (8usize, N / 8);
+        while m > 1 {
+            let hm = m >> 1;
+            let dt = t << 1;
+            let mut i = 0usize;
+            let mut j1 = 0usize;
+            while i < hm {
+                let w_v = _mm256_set1_epi32(ring.inv_ntt_table[hm + i] as i32);
+                let ws_v = _mm256_set1_epi32(ring.inv_ntt_table_shoup[hm + i] as i32);
+                let mut j = j1;
+                while j < j1 + t {
+                    let u = _mm256_loadu_si256(p.as_ptr().add(j) as *const __m256i);
+                    let v = _mm256_loadu_si256(p.as_ptr().add(j + t) as *const __m256i);
+                    let new_u = add_mod_v(u, v, q_v);
+                    let d = sub_mod_v(u, v, q_v);
+                    let new_v = shoup_mul_v(d, w_v, ws_v, q_v);
+                    _mm256_storeu_si256(p.as_mut_ptr().add(j) as *mut __m256i, new_u);
+                    _mm256_storeu_si256(p.as_mut_ptr().add(j + t) as *mut __m256i, new_v);
+                    j += LANES;
+                }
+                i += 1;
+                j1 += dt;
+            }
+            t = dt;
+            m = hm;
+        }
+        let n_inv_v = _mm256_set1_epi32(ring.n_inv as i32);
+        let n_inv_s_v = _mm256_set1_epi32(ring.n_inv_shoup as i32);
+        for chunk in 0..(N / LANES) {
+            let ptr = p.as_mut_ptr().add(chunk * LANES) as *mut __m256i;
+            let v = _mm256_loadu_si256(ptr as *const __m256i);
+            _mm256_storeu_si256(ptr, shoup_mul_v(v, n_inv_v, n_inv_s_v, q_v));
+        }
+    }
+
     /// Inverse stages with `t = 1, 2, 4`, mirroring [`ntt_tail`].
     #[inline]
     #[target_feature(enable = "avx2")]
@@ -548,77 +562,6 @@ pub(in crate::poly) mod avx2 {
         }
     }
 
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn ntt_avx2<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
-        let q_v = _mm256_set1_epi32(ring.q as i32);
-        let mut t = N;
-        for l in 0..(N.trailing_zeros() as usize - 3) {
-            let m = 1usize << l;
-            let ht = t >> 1;
-            let mut i = 0usize;
-            let mut j1 = 0usize;
-            while i < m {
-                let w_v = _mm256_set1_epi32(ring.ntt_table[m + i] as i32);
-                let ws_v = _mm256_set1_epi32(ring.ntt_table_shoup[m + i] as i32);
-                let mut j = j1;
-                while j < j1 + ht {
-                    let u = _mm256_loadu_si256(p.as_ptr().add(j) as *const __m256i);
-                    let v = _mm256_loadu_si256(p.as_ptr().add(j + ht) as *const __m256i);
-                    let v_red = shoup_mul_v(v, w_v, ws_v, q_v);
-                    let new_u = add_mod_v(u, v_red, q_v);
-                    let new_v = sub_mod_v(u, v_red, q_v);
-                    _mm256_storeu_si256(p.as_mut_ptr().add(j) as *mut __m256i, new_u);
-                    _mm256_storeu_si256(p.as_mut_ptr().add(j + ht) as *mut __m256i, new_v);
-                    j += LANES;
-                }
-                i += 1;
-                j1 += t;
-            }
-            t = ht;
-        }
-        debug_assert_eq!(t, 8);
-        ntt_tail(ring, p, q_v);
-    }
-
-    #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn inv_ntt_avx2<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
-        let q_v = _mm256_set1_epi32(ring.q as i32);
-        inv_ntt_tail(ring, p, q_v);
-        let (mut t, mut m) = (8usize, N / 8);
-        while m > 1 {
-            let hm = m >> 1;
-            let dt = t << 1;
-            let mut i = 0usize;
-            let mut j1 = 0usize;
-            while i < hm {
-                let w_v = _mm256_set1_epi32(ring.inv_ntt_table[hm + i] as i32);
-                let ws_v = _mm256_set1_epi32(ring.inv_ntt_table_shoup[hm + i] as i32);
-                let mut j = j1;
-                while j < j1 + t {
-                    let u = _mm256_loadu_si256(p.as_ptr().add(j) as *const __m256i);
-                    let v = _mm256_loadu_si256(p.as_ptr().add(j + t) as *const __m256i);
-                    let new_u = add_mod_v(u, v, q_v);
-                    let d = sub_mod_v(u, v, q_v);
-                    let new_v = shoup_mul_v(d, w_v, ws_v, q_v);
-                    _mm256_storeu_si256(p.as_mut_ptr().add(j) as *mut __m256i, new_u);
-                    _mm256_storeu_si256(p.as_mut_ptr().add(j + t) as *mut __m256i, new_v);
-                    j += LANES;
-                }
-                i += 1;
-                j1 += dt;
-            }
-            t = dt;
-            m = hm;
-        }
-        let n_inv_v = _mm256_set1_epi32(ring.n_inv as i32);
-        let n_inv_s_v = _mm256_set1_epi32(ring.n_inv_shoup as i32);
-        for chunk in 0..(N / LANES) {
-            let ptr = p.as_mut_ptr().add(chunk * LANES) as *mut __m256i;
-            let v = _mm256_loadu_si256(ptr as *const __m256i);
-            _mm256_storeu_si256(ptr, shoup_mul_v(v, n_inv_v, n_inv_s_v, q_v));
-        }
-    }
-
     /// `lhs[i]·rhs[i] mod q` via two Montgomery rounds, the second
     /// against `r2` to leave the Montgomery domain.
     #[target_feature(enable = "avx2")]
@@ -639,6 +582,52 @@ pub(in crate::poly) mod avx2 {
             let c = mont_mul_v(t, r2_v, q64_v, qinv_v);
             _mm256_storeu_si256(out.as_mut_ptr().add(off) as *mut __m256i, c);
         }
+    }
+
+    /// Montgomery product `a·b·2^-32 mod q` across 8 u32 lanes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn mont_mul_v(a: __m256i, b: __m256i, q64_v: __m256i, qinv_v: __m256i) -> __m256i {
+        let mask = lo_mask();
+        let re = mont_mul_half(
+            _mm256_and_si256(a, mask),
+            _mm256_and_si256(b, mask),
+            q64_v,
+            qinv_v,
+        );
+        let ro = mont_mul_half(
+            _mm256_srli_epi64(a, 32),
+            _mm256_srli_epi64(b, 32),
+            q64_v,
+            qinv_v,
+        );
+        _mm256_or_si256(re, _mm256_slli_epi64(ro, 32))
+    }
+
+    /// Montgomery product on one u64 half: inputs are u32 values in the low
+    /// 32 bits of each u64 lane, output likewise, canonical in `[0, q)`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn mont_mul_half(a: __m256i, b: __m256i, q64_v: __m256i, qinv_v: __m256i) -> __m256i {
+        let x = _mm256_mul_epu32(a, b);
+        mont_reduce_half(x, q64_v, qinv_v)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn mont_reduce_half(x: __m256i, q64_v: __m256i, qinv_v: __m256i) -> __m256i {
+        let m = _mm256_and_si256(_mm256_mul_epu32(x, qinv_v), lo_mask());
+        let t = _mm256_srli_epi64(_mm256_add_epi64(x, _mm256_mul_epu32(m, q64_v)), 32);
+        csub64(t, q64_v)
+    }
+
+    /// `if v >= q { v - q } else { v }` on 4 × u64 lanes holding values < 2^31.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn csub64(v: __m256i, q_v: __m256i) -> __m256i {
+        let d = _mm256_sub_epi64(v, q_v);
+        let lt = _mm256_cmpgt_epi64(_mm256_setzero_si256(), d);
+        _mm256_blendv_epi8(d, v, lt)
     }
 
     #[target_feature(enable = "avx2")]
@@ -694,6 +683,23 @@ pub(in crate::poly) mod avx2 {
         }
     }
 
+    #[target_feature(enable = "avx2")]
+    pub(in crate::poly) unsafe fn reduce_channel_i64_avx2<const N: usize>(
+        ring: &Ring32<N>,
+        input: &[i64; N],
+        output: &mut [u32; N],
+    ) {
+        for offset in (0..N).step_by(4) {
+            let value = _mm256_loadu_si256(input.as_ptr().add(offset) as *const __m256i);
+            let residue = reduce_i64x4(ring, value);
+            let mut lanes = [0u64; 4];
+            _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, residue);
+            for lane in 0..4 {
+                output[offset + lane] = lanes[lane] as u32;
+            }
+        }
+    }
+
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn reduce_i64x4<const N: usize>(ring: &Ring32<N>, value: __m256i) -> __m256i {
@@ -711,23 +717,6 @@ pub(in crate::poly) mod avx2 {
         let residue = mont_mul_half(montgomery, r2, q, q_inv);
         let negated = csub64(_mm256_sub_epi64(q, residue), q);
         _mm256_blendv_epi8(residue, negated, sign)
-    }
-
-    #[target_feature(enable = "avx2")]
-    pub(in crate::poly) unsafe fn reduce_channel_i64_avx2<const N: usize>(
-        ring: &Ring32<N>,
-        input: &[i64; N],
-        output: &mut [u32; N],
-    ) {
-        for offset in (0..N).step_by(4) {
-            let value = _mm256_loadu_si256(input.as_ptr().add(offset) as *const __m256i);
-            let residue = reduce_i64x4(ring, value);
-            let mut lanes = [0u64; 4];
-            _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, residue);
-            for lane in 0..4 {
-                output[offset + lane] = lanes[lane] as u32;
-            }
-        }
     }
 
     #[target_feature(enable = "avx2")]
@@ -828,190 +817,11 @@ pub(in crate::poly) mod neon {
 
     const LANES: usize = 4;
 
-    #[inline(always)]
-    unsafe fn canonicalize(v: int32x4_t, q_v: int32x4_t) -> int32x4_t {
-        let zero = vdupq_n_s32(0);
-        let add_q = vandq_u32(vcltq_s32(v, zero), vreinterpretq_u32_s32(q_v));
-        let v = vaddq_s32(v, vreinterpretq_s32_u32(add_q));
-        let sub_q = vandq_u32(vcgeq_s32(v, q_v), vreinterpretq_u32_s32(q_v));
-        vsubq_s32(v, vreinterpretq_s32_u32(sub_q))
-    }
-
-    #[inline(always)]
-    unsafe fn add_mod_v(a: int32x4_t, b: int32x4_t, q_v: int32x4_t) -> int32x4_t {
-        canonicalize(vaddq_s32(a, b), q_v)
-    }
-
-    #[inline(always)]
-    unsafe fn sub_mod_v(a: int32x4_t, b: int32x4_t, q_v: int32x4_t) -> int32x4_t {
-        canonicalize(vsubq_s32(a, b), q_v)
-    }
-
-    #[inline(always)]
-    unsafe fn sub_if_ge(v: int32x4_t, bound: int32x4_t) -> int32x4_t {
-        let subtract = vandq_u32(vcgeq_s32(v, bound), vreinterpretq_u32_s32(bound));
-        vsubq_s32(v, vreinterpretq_s32_u32(subtract))
-    }
-
-    #[inline(always)]
-    unsafe fn add_if_negative(v: int32x4_t, bound: int32x4_t) -> int32x4_t {
-        let add = vandq_u32(vcltq_s32(v, vdupq_n_s32(0)), vreinterpretq_u32_s32(bound));
-        vaddq_s32(v, vreinterpretq_s32_u32(add))
-    }
-
-    #[inline(always)]
-    fn centered_twiddle(w: u32, w_shoup: u32, q: u32) -> (i32, i32) {
-        let mut centered = w as i64;
-        let mut scaled = ((w_shoup as u64 + 1) >> 1) as i64;
-        if w > q / 2 {
-            centered -= q as i64;
-            scaled -= 1i64 << 31;
-        }
-        (centered as i32, scaled as i32)
-    }
-
-    #[inline(always)]
-    unsafe fn twiddle_v(w: u32, w_shoup: u32, q: u32) -> (int32x4_t, int32x4_t) {
-        let (w, scaled) = centered_twiddle(w, w_shoup, q);
-        (vdupq_n_s32(w), vdupq_n_s32(scaled))
-    }
-
-    #[inline(always)]
-    unsafe fn twiddle_pairs(
-        w0: u32,
-        ws0: u32,
-        w1: u32,
-        ws1: u32,
-        q: u32,
-    ) -> (int32x4_t, int32x4_t) {
-        let (w0, s0) = centered_twiddle(w0, ws0, q);
-        let (w1, s1) = centered_twiddle(w1, ws1, q);
-        let w = vset_lane_s32::<1>(w1, vdup_n_s32(w0));
-        let s = vset_lane_s32::<1>(s1, vdup_n_s32(s0));
-        (vcombine_s32(w, w), vcombine_s32(s, s))
-    }
-
-    #[inline(always)]
-    unsafe fn becker_mul_v(
-        a: int32x4_t,
-        w_v: int32x4_t,
-        scaled_v: int32x4_t,
-        q_v: int32x4_t,
-    ) -> int32x4_t {
-        let quotient = vqrdmulhq_s32(a, scaled_v);
-        let mut product = vmulq_s32(a, w_v);
-        asm!(
-            "mls {product:v}.4s, {quotient:v}.4s, {q:v}.4s",
-            product = inout(vreg) product,
-            quotient = in(vreg) quotient,
-            q = in(vreg) q_v,
-            options(pure, nomem, nostack)
-        );
-        canonicalize(product, q_v)
-    }
-
-    #[inline(always)]
-    unsafe fn mont_mul_half(
-        a: uint32x2_t,
-        b: uint32x2_t,
-        q_v: uint32x2_t,
-        q_inv_v: uint32x2_t,
-    ) -> uint32x2_t {
-        let x = vmull_u32(a, b);
-        mont_reduce_half(x, q_v, q_inv_v)
-    }
-
-    #[inline(always)]
-    unsafe fn mont_reduce_half(x: uint64x2_t, q_v: uint32x2_t, q_inv_v: uint32x2_t) -> uint32x2_t {
-        let m = vmul_u32(vmovn_u64(x), q_inv_v);
-        let t = vshrq_n_u64::<32>(vaddq_u64(x, vmull_u32(m, q_v)));
-        vmovn_u64(t)
-    }
-
-    #[inline(always)]
-    unsafe fn mont_mul_v(a: uint32x4_t, b: uint32x4_t, q: u32, q_inv: u32) -> uint32x4_t {
-        let q2 = vdup_n_u32(q);
-        let qi2 = vdup_n_u32(q_inv);
-        let lo = mont_mul_half(vget_low_u32(a), vget_low_u32(b), q2, qi2);
-        let hi = mont_mul_half(vget_high_u32(a), vget_high_u32(b), q2, qi2);
-        let v = vcombine_u32(lo, hi);
-        vreinterpretq_u32_s32(canonicalize(
-            vreinterpretq_s32_u32(v),
-            vdupq_n_s32(q as i32),
-        ))
-    }
-
-    #[inline]
-    unsafe fn ntt_tail<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N], q_v: int32x4_t) {
-        let (m2, m1) = (N / 4, N / 2);
-        for g in 0..(N / LANES) {
-            let ptr = p.as_mut_ptr().add(g * LANES);
-            let mut x = vreinterpretq_s32_u32(vld1q_u32(ptr));
-
-            let (w, scaled) =
-                twiddle_v(ring.ntt_table[m2 + g], ring.ntt_table_shoup[m2 + g], ring.q);
-            let u = vcombine_s32(vget_low_s32(x), vget_low_s32(x));
-            let v = becker_mul_v(
-                vcombine_s32(vget_high_s32(x), vget_high_s32(x)),
-                w,
-                scaled,
-                q_v,
-            );
-            x = vcombine_s32(
-                vget_low_s32(add_mod_v(u, v, q_v)),
-                vget_low_s32(sub_mod_v(u, v, q_v)),
-            );
-
-            let i = m1 + 2 * g;
-            let (w, scaled) = twiddle_pairs(
-                ring.ntt_table[i],
-                ring.ntt_table_shoup[i],
-                ring.ntt_table[i + 1],
-                ring.ntt_table_shoup[i + 1],
-                ring.q,
-            );
-            let u = vuzp1q_s32(x, x);
-            let v = becker_mul_v(vuzp2q_s32(x, x), w, scaled, q_v);
-            x = vzip1q_s32(add_mod_v(u, v, q_v), sub_mod_v(u, v, q_v));
-
-            vst1q_u32(ptr, vreinterpretq_u32_s32(x));
-        }
-    }
-
-    #[inline]
-    unsafe fn inv_ntt_tail<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N], q_v: int32x4_t) {
-        let (m1, m2) = (N / 2, N / 4);
-        for g in 0..(N / LANES) {
-            let ptr = p.as_mut_ptr().add(g * LANES);
-            let mut x = vreinterpretq_s32_u32(vld1q_u32(ptr));
-
-            let i = m1 + 2 * g;
-            let (w, scaled) = twiddle_pairs(
-                ring.inv_ntt_table[i],
-                ring.inv_ntt_table_shoup[i],
-                ring.inv_ntt_table[i + 1],
-                ring.inv_ntt_table_shoup[i + 1],
-                ring.q,
-            );
-            let u = vuzp1q_s32(x, x);
-            let v = vuzp2q_s32(x, x);
-            x = vzip1q_s32(
-                add_mod_v(u, v, q_v),
-                becker_mul_v(sub_mod_v(u, v, q_v), w, scaled, q_v),
-            );
-
-            let (w, scaled) = twiddle_v(
-                ring.inv_ntt_table[m2 + g],
-                ring.inv_ntt_table_shoup[m2 + g],
-                ring.q,
-            );
-            let u = vcombine_s32(vget_low_s32(x), vget_low_s32(x));
-            let v = vcombine_s32(vget_high_s32(x), vget_high_s32(x));
-            let sum = add_mod_v(u, v, q_v);
-            let diff = becker_mul_v(sub_mod_v(u, v, q_v), w, scaled, q_v);
-            x = vcombine_s32(vget_low_s32(sum), vget_low_s32(diff));
-
-            vst1q_u32(ptr, vreinterpretq_u32_s32(x));
+    pub(super) unsafe fn ntt_neon<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
+        if (ring.q as u64) * 4 < (1u64 << 31) {
+            ntt_neon_inner::<N, true>(ring, p);
+        } else {
+            ntt_neon_inner::<N, false>(ring, p);
         }
     }
 
@@ -1058,11 +868,130 @@ pub(in crate::poly) mod neon {
         ntt_tail(ring, p, q_v);
     }
 
-    pub(super) unsafe fn ntt_neon<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
+    #[inline(always)]
+    unsafe fn twiddle_v(w: u32, w_shoup: u32, q: u32) -> (int32x4_t, int32x4_t) {
+        let (w, scaled) = centered_twiddle(w, w_shoup, q);
+        (vdupq_n_s32(w), vdupq_n_s32(scaled))
+    }
+
+    #[inline(always)]
+    fn centered_twiddle(w: u32, w_shoup: u32, q: u32) -> (i32, i32) {
+        let mut centered = w as i64;
+        let mut scaled = ((w_shoup as u64 + 1) >> 1) as i64;
+        if w > q / 2 {
+            centered -= q as i64;
+            scaled -= 1i64 << 31;
+        }
+        (centered as i32, scaled as i32)
+    }
+
+    #[inline(always)]
+    unsafe fn becker_mul_v(
+        a: int32x4_t,
+        w_v: int32x4_t,
+        scaled_v: int32x4_t,
+        q_v: int32x4_t,
+    ) -> int32x4_t {
+        let quotient = vqrdmulhq_s32(a, scaled_v);
+        let mut product = vmulq_s32(a, w_v);
+        asm!(
+            "mls {product:v}.4s, {quotient:v}.4s, {q:v}.4s",
+            product = inout(vreg) product,
+            quotient = in(vreg) quotient,
+            q = in(vreg) q_v,
+            options(pure, nomem, nostack)
+        );
+        canonicalize(product, q_v)
+    }
+
+    #[inline(always)]
+    unsafe fn canonicalize(v: int32x4_t, q_v: int32x4_t) -> int32x4_t {
+        let zero = vdupq_n_s32(0);
+        let add_q = vandq_u32(vcltq_s32(v, zero), vreinterpretq_u32_s32(q_v));
+        let v = vaddq_s32(v, vreinterpretq_s32_u32(add_q));
+        let sub_q = vandq_u32(vcgeq_s32(v, q_v), vreinterpretq_u32_s32(q_v));
+        vsubq_s32(v, vreinterpretq_s32_u32(sub_q))
+    }
+
+    #[inline(always)]
+    unsafe fn sub_if_ge(v: int32x4_t, bound: int32x4_t) -> int32x4_t {
+        let subtract = vandq_u32(vcgeq_s32(v, bound), vreinterpretq_u32_s32(bound));
+        vsubq_s32(v, vreinterpretq_s32_u32(subtract))
+    }
+
+    #[inline(always)]
+    unsafe fn add_if_negative(v: int32x4_t, bound: int32x4_t) -> int32x4_t {
+        let add = vandq_u32(vcltq_s32(v, vdupq_n_s32(0)), vreinterpretq_u32_s32(bound));
+        vaddq_s32(v, vreinterpretq_s32_u32(add))
+    }
+
+    #[inline(always)]
+    unsafe fn add_mod_v(a: int32x4_t, b: int32x4_t, q_v: int32x4_t) -> int32x4_t {
+        canonicalize(vaddq_s32(a, b), q_v)
+    }
+
+    #[inline(always)]
+    unsafe fn sub_mod_v(a: int32x4_t, b: int32x4_t, q_v: int32x4_t) -> int32x4_t {
+        canonicalize(vsubq_s32(a, b), q_v)
+    }
+
+    #[inline]
+    unsafe fn ntt_tail<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N], q_v: int32x4_t) {
+        let (m2, m1) = (N / 4, N / 2);
+        for g in 0..(N / LANES) {
+            let ptr = p.as_mut_ptr().add(g * LANES);
+            let mut x = vreinterpretq_s32_u32(vld1q_u32(ptr));
+
+            let (w, scaled) =
+                twiddle_v(ring.ntt_table[m2 + g], ring.ntt_table_shoup[m2 + g], ring.q);
+            let u = vcombine_s32(vget_low_s32(x), vget_low_s32(x));
+            let v = becker_mul_v(
+                vcombine_s32(vget_high_s32(x), vget_high_s32(x)),
+                w,
+                scaled,
+                q_v,
+            );
+            x = vcombine_s32(
+                vget_low_s32(add_mod_v(u, v, q_v)),
+                vget_low_s32(sub_mod_v(u, v, q_v)),
+            );
+
+            let i = m1 + 2 * g;
+            let (w, scaled) = twiddle_pairs(
+                ring.ntt_table[i],
+                ring.ntt_table_shoup[i],
+                ring.ntt_table[i + 1],
+                ring.ntt_table_shoup[i + 1],
+                ring.q,
+            );
+            let u = vuzp1q_s32(x, x);
+            let v = becker_mul_v(vuzp2q_s32(x, x), w, scaled, q_v);
+            x = vzip1q_s32(add_mod_v(u, v, q_v), sub_mod_v(u, v, q_v));
+
+            vst1q_u32(ptr, vreinterpretq_u32_s32(x));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn twiddle_pairs(
+        w0: u32,
+        ws0: u32,
+        w1: u32,
+        ws1: u32,
+        q: u32,
+    ) -> (int32x4_t, int32x4_t) {
+        let (w0, s0) = centered_twiddle(w0, ws0, q);
+        let (w1, s1) = centered_twiddle(w1, ws1, q);
+        let w = vset_lane_s32::<1>(w1, vdup_n_s32(w0));
+        let s = vset_lane_s32::<1>(s1, vdup_n_s32(s0));
+        (vcombine_s32(w, w), vcombine_s32(s, s))
+    }
+
+    pub(super) unsafe fn inv_ntt_neon<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
         if (ring.q as u64) * 4 < (1u64 << 31) {
-            ntt_neon_inner::<N, true>(ring, p);
+            inv_ntt_neon_inner::<N, true>(ring, p);
         } else {
-            ntt_neon_inner::<N, false>(ring, p);
+            inv_ntt_neon_inner::<N, false>(ring, p);
         }
     }
 
@@ -1117,11 +1046,40 @@ pub(in crate::poly) mod neon {
         }
     }
 
-    pub(super) unsafe fn inv_ntt_neon<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N]) {
-        if (ring.q as u64) * 4 < (1u64 << 31) {
-            inv_ntt_neon_inner::<N, true>(ring, p);
-        } else {
-            inv_ntt_neon_inner::<N, false>(ring, p);
+    #[inline]
+    unsafe fn inv_ntt_tail<const N: usize>(ring: &Ring32<N>, p: &mut [u32; N], q_v: int32x4_t) {
+        let (m1, m2) = (N / 2, N / 4);
+        for g in 0..(N / LANES) {
+            let ptr = p.as_mut_ptr().add(g * LANES);
+            let mut x = vreinterpretq_s32_u32(vld1q_u32(ptr));
+
+            let i = m1 + 2 * g;
+            let (w, scaled) = twiddle_pairs(
+                ring.inv_ntt_table[i],
+                ring.inv_ntt_table_shoup[i],
+                ring.inv_ntt_table[i + 1],
+                ring.inv_ntt_table_shoup[i + 1],
+                ring.q,
+            );
+            let u = vuzp1q_s32(x, x);
+            let v = vuzp2q_s32(x, x);
+            x = vzip1q_s32(
+                add_mod_v(u, v, q_v),
+                becker_mul_v(sub_mod_v(u, v, q_v), w, scaled, q_v),
+            );
+
+            let (w, scaled) = twiddle_v(
+                ring.inv_ntt_table[m2 + g],
+                ring.inv_ntt_table_shoup[m2 + g],
+                ring.q,
+            );
+            let u = vcombine_s32(vget_low_s32(x), vget_low_s32(x));
+            let v = vcombine_s32(vget_high_s32(x), vget_high_s32(x));
+            let sum = add_mod_v(u, v, q_v);
+            let diff = becker_mul_v(sub_mod_v(u, v, q_v), w, scaled, q_v);
+            x = vcombine_s32(vget_low_s32(sum), vget_low_s32(diff));
+
+            vst1q_u32(ptr, vreinterpretq_u32_s32(x));
         }
     }
 
@@ -1145,6 +1103,37 @@ pub(in crate::poly) mod neon {
         for i in vector_end..N {
             out[i] = mul_mod(lhs[i], rhs[i], ring);
         }
+    }
+
+    #[inline(always)]
+    unsafe fn mont_mul_v(a: uint32x4_t, b: uint32x4_t, q: u32, q_inv: u32) -> uint32x4_t {
+        let q2 = vdup_n_u32(q);
+        let qi2 = vdup_n_u32(q_inv);
+        let lo = mont_mul_half(vget_low_u32(a), vget_low_u32(b), q2, qi2);
+        let hi = mont_mul_half(vget_high_u32(a), vget_high_u32(b), q2, qi2);
+        let v = vcombine_u32(lo, hi);
+        vreinterpretq_u32_s32(canonicalize(
+            vreinterpretq_s32_u32(v),
+            vdupq_n_s32(q as i32),
+        ))
+    }
+
+    #[inline(always)]
+    unsafe fn mont_mul_half(
+        a: uint32x2_t,
+        b: uint32x2_t,
+        q_v: uint32x2_t,
+        q_inv_v: uint32x2_t,
+    ) -> uint32x2_t {
+        let x = vmull_u32(a, b);
+        mont_reduce_half(x, q_v, q_inv_v)
+    }
+
+    #[inline(always)]
+    unsafe fn mont_reduce_half(x: uint64x2_t, q_v: uint32x2_t, q_inv_v: uint32x2_t) -> uint32x2_t {
+        let m = vmul_u32(vmovn_u64(x), q_inv_v);
+        let t = vshrq_n_u64::<32>(vaddq_u64(x, vmull_u32(m, q_v)));
+        vmovn_u64(t)
     }
 
     pub(super) unsafe fn pointwise_dot_neon<const N: usize>(
@@ -1216,6 +1205,17 @@ pub(in crate::poly) mod neon {
         }
     }
 
+    pub(in crate::poly) unsafe fn reduce_channel_i64_neon<const N: usize>(
+        ring: &Ring32<N>,
+        input: &[i64; N],
+        output: &mut [u32; N],
+    ) {
+        for offset in (0..N).step_by(2) {
+            let value = vld1q_s64(input.as_ptr().add(offset));
+            vst1_u32(output.as_mut_ptr().add(offset), reduce_i64x2(ring, value));
+        }
+    }
+
     #[inline(always)]
     unsafe fn reduce_i64x2<const N: usize>(ring: &Ring32<N>, value: int64x2_t) -> uint32x2_t {
         let q = vdup_n_u32(ring.q);
@@ -1234,17 +1234,6 @@ pub(in crate::poly) mod neon {
         let negated = vsub_u32(negated, vand_u32(vcge_u32(negated, q), q));
         let negative = vmovn_u64(negative64);
         vbsl_u32(negative, negated, residue)
-    }
-
-    pub(in crate::poly) unsafe fn reduce_channel_i64_neon<const N: usize>(
-        ring: &Ring32<N>,
-        input: &[i64; N],
-        output: &mut [u32; N],
-    ) {
-        for offset in (0..N).step_by(2) {
-            let value = vld1q_s64(input.as_ptr().add(offset));
-            vst1_u32(output.as_mut_ptr().add(offset), reduce_i64x2(ring, value));
-        }
     }
 
     pub(in crate::poly) unsafe fn reduce_centered_i32_neon<const N: usize>(
