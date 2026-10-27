@@ -106,8 +106,8 @@ fn shoup_mul(a: u32, w: u32, w_shoup: u32, q: u32) -> u32 {
 /// conditional jump.
 #[inline(always)]
 fn csub(x: u32, q: u32) -> u32 {
-    let d = x.wrapping_sub(q);
-    d.wrapping_add(q & (((d as i32) >> 31) as u32))
+    let difference = x.wrapping_sub(q);
+    difference.wrapping_add(q & (((difference as i32) >> 31) as u32))
 }
 
 #[inline(always)]
@@ -117,8 +117,8 @@ pub fn add_mod(a: u32, b: u32, q: u32) -> u32 {
 
 #[inline(always)]
 pub fn sub_mod(a: u32, b: u32, q: u32) -> u32 {
-    let d = a.wrapping_sub(b);
-    d.wrapping_add(q & (((d as i32) >> 31) as u32))
+    let difference = a.wrapping_sub(b);
+    difference.wrapping_add(q & (((difference as i32) >> 31) as u32))
 }
 
 /// Inverse NTT over canonical `[0, q)` values, in place (includes the final
